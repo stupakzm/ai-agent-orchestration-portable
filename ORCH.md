@@ -128,7 +128,7 @@ if not check:
         (pathlib.Path(".claude/hooks") / h).chmod(0o755)
     pathlib.Path(".work").mkdir(exist_ok=True)
     # git does not track empty dirs; .gitkeep keeps the layout intact on clone
-    for d in ("memory/blocks", "cards", "queue", "registry", "checkpoints", "traces"):
+    for d in ("memory/blocks", "memory/receipts", "cards", "queue", "registry", "checkpoints", "traces"):
         q = pathlib.Path(".orch") / d
         q.mkdir(parents=True, exist_ok=True)
         (q / ".gitkeep").touch()
@@ -345,6 +345,7 @@ your own recurring packet defects. Architecture: `ORCH.md`.
   upstream.md                 # findings about ORCH itself — carried back by hand
   memory/INDEX.md             # L0 headline index
   memory/blocks/blk_*.md      # L1 summary + L2 body
+  memory/receipts/<task>.log  # archivist write receipts, one line per block
   cards/<project>.md          # project cards
   queue/tsk_*.yaml            # task packets
   registry/<project>.yaml     # acceptance registry
@@ -465,7 +466,35 @@ import shlex
 import sys
 from pathlib import Path
 
-ROOT = Path(os.environ.get("CLAUDE_PROJECT_DIR", ".")).resolve()
+
+def project_root():
+    """The MAIN checkout, where .orch/ lives — never a task worktree.
+
+    CLAUDE_PROJECT_DIR is not trustworthy: it follows the orchestrator's cwd
+    into .work/<id>, where .orch/ does not exist (it is often gitignored, and a
+    queued packet is uncommitted either way). Reading policy from there means
+    reading no policy. So: start from this script's own location
+    (.claude/hooks/ -> parents[2]), and if that is itself a linked worktree,
+    follow its .git file back to the main checkout. The env var is a fallback
+    only, and gets the same worktree resolution."""
+    def main_of(p):
+        g = p / ".git"
+        if g.is_file():                    # linked worktree: "gitdir: <main>/.git/worktrees/<id>"
+            m = re.match(r"gitdir:\s*(.+)", g.read_text().strip())
+            if m:
+                gd = Path(m.group(1))
+                gd = (gd if gd.is_absolute() else p / gd).resolve()
+                if gd.parent.name == "worktrees":
+                    return gd.parent.parent.parent
+        return p
+    here = main_of(Path(__file__).resolve().parents[2])
+    if (here / ".orch").is_dir():
+        return here
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    return main_of(Path(env).resolve()) if env else here
+
+
+ROOT = project_root()
 
 # ── immutable: irreversible / externally-visible operations.
 # COMMANDS are matched at command position only — see commands() for why.
@@ -502,6 +531,92 @@ SEPARATORS = {";", "&", "&&", "||", "|", "(", ")", "{", "}", "\n"}
 WRAPPERS = {"bash", "sh", "zsh", "dash", "ksh", "env", "eval", "exec", "sudo",
             "doas", "nohup", "timeout", "xargs", "ssh", "nice", "setsid", "command"}
 SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+HEREDOC = re.compile(r"<<(-?)[ \t]*(?:'([^'\n]+)'|\"([^\"\n]+)\"|\\(\w+)|([A-Za-z_]\w*))")
+
+
+def runs_shell(header):
+    """Does this heredoc's header line hand its body to a shell? Conservative:
+    unparseable, or any wrapper word anywhere, counts as yes."""
+    try:
+        lex = shlex.shlex(header, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return any(t.rsplit("/", 1)[-1] in WRAPPERS for t in lex)
+    except ValueError:
+        return True
+
+
+def strip_quoted_heredocs(cmd):
+    """Drop the bodies of quoted heredocs (<<'X', <<"X", <<\\X) that are not fed
+    to a shell. Bash expands nothing in them, so a body is data: markdown that
+    shows `rm -rf a/b` in a code span is not a command substitution, and the
+    guard blocking it blocked the orchestrator writing its own checkpoint.
+    Unquoted heredocs keep their bodies — bash does expand $(...) there. A
+    body piped to a shell (`cat <<'X' | bash`) is kept: it runs.
+
+    Operators are found by a quote- and comment-aware scan, never a regex over
+    the raw string — otherwise `echo "<<'Y'"` would hide the next line."""
+    out, pending, q, i, n, head = [], [], None, 0, len(cmd), 0
+    while i < n:
+        c = cmd[i]
+        if q:
+            out.append(c)
+            if c == q:
+                q = None
+            elif c == "\\" and q == '"' and i + 1 < n:
+                out.append(cmd[i + 1])
+                i += 1
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c in "'\"":
+            q = c
+        elif c == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|()"):
+            j = cmd.find("\n", i)
+            j = n if j < 0 else j
+            out.append(cmd[i:j])
+            i = j
+            continue
+        elif cmd.startswith("<<<", i):
+            out.append("<<<")
+            i += 3
+            continue
+        elif cmd.startswith("<<", i):
+            m = HEREDOC.match(cmd, i)
+            if m:
+                pending.append(m)
+                out.append(m.group(0))
+                i = m.end()
+                continue
+        elif c == "\n" and pending:
+            executes = runs_shell(cmd[head:i])
+            out.append("\n")
+            i += 1
+            for m in pending:
+                delim = next(g for g in m.groups()[1:] if g is not None)
+                start, term = i, ""
+                while i < n:
+                    j = cmd.find("\n", i)
+                    j = n if j < 0 else j
+                    line = cmd[i:j]
+                    if (line.lstrip("\t") if m.group(1) else line) == delim:
+                        body, term, i = cmd[start:i], line, j
+                        break
+                    i = j + 1
+                else:
+                    body = cmd[start:]
+                quoted = m.group(5) is None
+                out.append(body if (not quoted or executes) else "")
+                out.append(term)
+            pending, head = [], i
+            continue
+        elif c == "\n":
+            head = i + 1
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def commands(cmd, depth=0):
@@ -519,10 +634,12 @@ def commands(cmd, depth=0):
     A quoted multi-word argument cannot itself be a command, so it is masked.
     Two things genuinely do execute their argument and are recursed into rather
     than masked: a shell wrapper (`bash -c "..."`) and a command substitution
-    (`$(...)`, backticks).
+    (`$(...)`, backticks). Quoted heredoc bodies are data and are removed
+    first — see strip_quoted_heredocs().
     """
     if depth > 3:
         return
+    cmd = strip_quoted_heredocs(cmd)
     for m in SUBST.finditer(cmd):
         yield from commands(m.group(1) or m.group(2) or "", depth + 1)
     try:
@@ -612,6 +729,44 @@ def active_scope():
     return paths
 
 
+def bash_trigger(cmd):
+    """The first trigger `cmd` would hit, or None. The hook and --lint share
+    this, so a lint can never disagree with the guard it predicts."""
+    for pat, why in CONTENT:
+        if re.search(pat, cmd, re.I):
+            return why
+    for seg in commands(cmd):
+        for pat, why in COMMANDS:
+            if re.search(pat, seg, re.I):
+                return why
+    return None
+
+
+def lint(path):
+    """`orch-guard.py --lint <file|->`: which commands in a dispatch prompt the
+    guard would block. Run it on every prompt before dispatch (orch-task §3):
+    a guarded step inside a prompt costs a whole attempt with zero progress.
+    Checks fenced blocks and inline code spans. Exit 1 on any hit, 0 clean,
+    2 if it could not read the file."""
+    try:
+        txt = sys.stdin.read() if path == "-" else Path(path).read_text()
+    except OSError as e:
+        sys.stderr.write(f"orch-guard --lint: {e}\n")
+        return 2
+    fences = re.findall(r"^```[^\n]*\n(.*?)^```", txt, re.M | re.S)
+    prose = re.sub(r"^```[^\n]*\n.*?^```", "", txt, flags=re.M | re.S)
+    snippets = fences + re.findall(r"`([^`\n]+)`", prose)
+    hits = [(why, sn) for sn in snippets for why in [bash_trigger(sn)] if why]
+    for why, sn in hits:
+        ls = sn.strip().splitlines()
+        line = next((x for x in ls if bash_trigger(x)), ls[0])   # the culprit, not line 1
+        print(f"blocked: {why} — {line.strip()[:100]}")
+    if hits:
+        print(f"\n{len(hits)} guarded command(s). Remove them from the prompt, "
+              "or raise the checkpoint BEFORE dispatch if one is truly needed.")
+    return 1 if hits else 0
+
+
 def block(reason):
     sys.stderr.write(
         f"ORCH checkpoint — blocked: {reason}\n"
@@ -629,18 +784,18 @@ def main():
     ti = ev.get("tool_input", {}) or {}
 
     if tool == "Bash":
-        cmd = ti.get("command", "")
-        for pat, why in CONTENT:
-            if re.search(pat, cmd, re.I):
-                block(f"{why} — irreversible or externally visible")
-        for seg in commands(cmd):
-            for pat, why in COMMANDS:
-                if re.search(pat, seg, re.I):
-                    block(f"{why} — irreversible or externally visible")
+        why = bash_trigger(ti.get("command", ""))
+        if why:
+            block(f"{why} — irreversible or externally visible")
 
     if tool in ("Write", "Edit", "NotebookEdit"):
         fp = ti.get("file_path", "")
         rel = os.path.relpath(fp, ROOT) if os.path.isabs(fp) else fp
+        # ROOT is the main checkout, so a write inside the task's own worktree
+        # arrives as .work/<task>/<path>. scope.paths are repo-relative.
+        wt = f".work/{os.environ.get('ORCH_TASK', '')}/"
+        if os.environ.get("ORCH_TASK") and rel.startswith(wt):
+            rel = rel[len(wt):]
         if SECRET_PATH.search(rel):
             block(f"write to a secrets path ({rel})")
         if rel.startswith(".orch/config/"):
@@ -660,6 +815,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--lint":
+        sys.exit(lint(sys.argv[2]))       # a tool, not the hook: errors exit 2
     try:
         main()
     except Exception as e:                # a broken guard fails open, loudly
@@ -728,11 +885,26 @@ in argv, which is the entire point: one of those patterns describes a
 force-push, and orch-guard would match it inside an inline grep's own arguments
 and block a read-only scan.
 
-    python3 .claude/hooks/orch-scan.py <worktree> [<base-ref>]   # base: HEAD^
+    python3 .claude/hooks/orch-scan.py <worktree> [<base-ref>] [--task <tsk_id>]
+    # base: HEAD^ · task: $ORCH_TASK
+
+With a task, two fields of its packet (.orch/queue/<id>.yaml) are honoured,
+both confirmed by the user with the rest of the packet, neither a model's
+call at scan time:
+  expects:  [<why>, ...]   medium findings with that `why` report as low — the
+                           task's own subject matter (a network client task
+                           adds network code). High findings are never lowered.
+  vendored: - {path: "<dir>", tree: "<tree-ish>"}
+                           content findings under <dir> are summarised, not
+                           gated, IF AND ONLY IF HEAD:<dir> is byte-identical
+                           to <tree-ish> (compared by git tree hash). A claim
+                           that does not hold is itself a high finding.
+                           Dependency manifests gate regardless.
 
 exit 0  clean, or low severity only
 exit 1  findings above `low` -> mandatory checkpoint before anything registers
-exit 2  usage or git error. It never reports clean when it could not look.
+exit 2  usage, git or internal error. It never reports clean (or findings)
+        when it could not look.
 """
 import os
 import re
@@ -742,7 +914,30 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 RANK = {"low": 0, "medium": 1, "high": 2}
-ROOT = Path(os.environ.get("CLAUDE_PROJECT_DIR", ".")).resolve()
+
+
+def project_root():
+    """The main checkout, never a task worktree — same resolution as
+    orch-guard.py, see its docstring. CLAUDE_PROJECT_DIR drifts into .work/<id>,
+    where there is no policy, and the scan then exits 2 on every task."""
+    def main_of(p):
+        g = p / ".git"
+        if g.is_file():
+            m = re.match(r"gitdir:\s*(.+)", g.read_text().strip())
+            if m:
+                gd = Path(m.group(1))
+                gd = (gd if gd.is_absolute() else p / gd).resolve()
+                if gd.parent.name == "worktrees":
+                    return gd.parent.parent.parent
+        return p
+    here = main_of(Path(__file__).resolve().parents[2])
+    if (here / ".orch").is_dir():
+        return here
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    return main_of(Path(env).resolve()) if env else here
+
+
+ROOT = project_root()
 ENTRY = re.compile(
     r'\s*-\s*\{severity:\s*(\w+)\s*,\s*why:\s*(.+?)\s*,\s*pattern:\s*"(.+)"\s*\}\s*$')
 
@@ -760,35 +955,75 @@ def policy():
     p = ROOT / ".orch/config/sensitive.yaml"
     if not p.exists():
         die(f"no policy at {p}")
-    pats, manifests, globs, section = [], [], [], None
+    pats, globs, lists, section = [], [], {}, None
     for line in p.read_text().splitlines():
         if re.match(r"^\w[\w_]*\s*:", line):
             section = line.split(":")[0]
         m = ENTRY.match(line)
         if m:
+            # Case-insensitive by default; a pattern that must be case-exact
+            # scopes it with (?-i:...) — `fetch(` is a call, `performFetch(` is not.
             raw = m.group(3).replace("\\\\", "\\")     # YAML double-quoted
             try:
                 pats.append((m.group(1), m.group(2), re.compile(raw, re.I)))
             except re.error as e:
                 die(f"unparseable pattern {raw!r}: {e}")
             continue
-        m = re.match(r"\s*dependency_manifests\s*:\s*\[(.+)\]", line)
+        m = re.match(r"^(\w+)\s*:\s*\[(.*)\]\s*(#.*)?$", line)
         if m:
-            manifests = [x.strip().strip("\"'") for x in m.group(1).split(",")]
+            lists[m.group(1)] = flow_list(m.group(2))
         elif section == "path_globs":
             m = re.match(r'\s*-\s*"(.+)"\s*$', line)
             if m:
                 globs.append(m.group(1))
     if not pats:
         die("policy parsed to zero patterns — refusing to pass")
-    return pats, manifests, globs
+    return pats, globs, lists
+
+
+def flow_list(s):
+    return [x.strip().strip("\"'") for x in s.split(",") if x.strip()]
+
+
+def packet(task):
+    """(expects, vendored) from the task's packet. A packet that cannot be read
+    lowers nothing: the scan just runs at full strictness, and says so."""
+    if not task:
+        return [], []
+    p = ROOT / f".orch/queue/{task}.yaml"
+    if not p.exists():
+        sys.stderr.write(f"orch-scan: no packet at {p}; expects/vendored ignored\n")
+        return [], []
+    txt = p.read_text()
+    m = re.search(r"^expects\s*:\s*\[(.*?)\]", txt, re.M)
+    expects = flow_list(m.group(1)) if m else []
+    vend = []
+    m = re.search(r"^vendored\s*:(.*?)(?=^\w|\Z)", txt, re.M | re.S)
+    if m:
+        for e in re.finditer(r'\{\s*path:\s*"?([^",}]+?)"?\s*,\s*tree:\s*"?([^",}]+?)"?\s*\}',
+                             m.group(1)):
+            vend.append((e.group(1).strip().rstrip("/"), e.group(2).strip()))
+    return expects, vend
+
+
+def rev(worktree, spec):
+    cp = subprocess.run(["git", "-C", worktree, "rev-parse", "--verify", "-q", spec],
+                        capture_output=True, text=True, errors="replace")
+    return cp.stdout.strip() if cp.returncode == 0 else None
+
+
+LOOPBACK = re.compile(r"^(localhost|127(\.\d+){3}|\[::1\]|0\.0\.0\.0)$", re.I)
+URL_HOST = re.compile(r"\bhttps?://([^/\s:'\"`$]+|\[[^\]]+\])")
 
 
 def added(worktree, base):
     """(path, text) for every ADDED line. Added lines only: an existing
     credential the task merely moved past is not this task's finding."""
-    cp = subprocess.run(["git", "-C", worktree, "diff", "--unified=0", base, "HEAD"],
-                        capture_output=True, text=True)
+    # --text + errors="replace": a binary or non-UTF-8 diff must be scanned,
+    # not crash. A crash used to exit 1, which reads as "findings".
+    cp = subprocess.run(["git", "-C", worktree, "diff", "--text", "--unified=0",
+                         base, "HEAD"],
+                        capture_output=True, text=True, errors="replace")
     if cp.returncode != 0:
         die(f"git diff failed: {cp.stderr.strip()}")
     path, out = None, []
@@ -806,17 +1041,63 @@ def hits(p, globs):
 
 
 def main():
-    if len(sys.argv) < 2:
-        die("usage: orch-scan.py <worktree> [<base-ref>]")
-    wt, base = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "HEAD^"
-    pats, manifests, globs = policy()
+    args = sys.argv[1:]
+    task = os.environ.get("ORCH_TASK")
+    if "--task" in args:
+        i = args.index("--task")
+        if i + 1 >= len(args):
+            die("--task needs a task id")
+        task = args[i + 1]
+        del args[i:i + 2]
+    if not args:
+        die("usage: orch-scan.py <worktree> [<base-ref>] [--task <tsk_id>]")
+    wt, base = args[0], args[1] if len(args) > 1 else "HEAD^"
+    pats, globs, lists = policy()
+    manifests = lists.get("dependency_manifests", [])
+    expects, vendored = packet(task)
     lines = added(wt, base)
+    paths = sorted({p for p, _ in lines if p})
     found = []
+
+    # vendored: a verbatim upstream tree is a different risk class from lines
+    # an agent wrote — but only once git proves it is verbatim.
+    vroots = []
+    for vpath, tree in vendored:
+        have = rev(wt, f"HEAD:{vpath}")
+        want = rev(wt, tree if ":" in tree else f"{tree}^{{tree}}")
+        if have and have == want:
+            vroots.append((vpath, tree))
+        else:
+            found.append(("high", f"{vpath}: packet declares it vendored from "
+                          f"{tree}, but the trees differ ({have} != {want}) — "
+                          f"treated as authored code"))
+
+    # network findings under test paths whose added lines name no external host
+    external = {p for p, t in lines for h in URL_HOST.findall(t)
+                if not LOOPBACK.match(h)}
+    test_paths, test_down = lists.get("test_paths", []), lists.get("test_downgrade", [])
+
+    vend_hits = {}
     for path, text in lines:
         for sev, why, rx in pats:
-            if rx.search(text):
-                found.append((sev, f"{path}: {why} — {text.strip()[:110]}"))
-    paths = sorted({p for p, _ in lines if p})
+            if not rx.search(text):
+                continue
+            vr = next((v for v in vroots if path and
+                       (path == v[0] or path.startswith(v[0] + "/"))), None)
+            if vr:
+                k = (vr, sev, why)
+                vend_hits[k] = vend_hits.get(k, 0) + 1
+                continue
+            note = ""
+            if sev == "medium" and why in expects:
+                sev, note = "low", " [packet expects:]"
+            elif (sev == "medium" and why in test_down and path
+                  and hits(path, test_paths) and path not in external):
+                sev, note = "low", " [test path, no external host]"
+            found.append((sev, f"{path}: {why}{note} — {text.strip()[:110]}"))
+    for ((vpath, tree), sev, why), n in sorted(vend_hits.items()):
+        found.append(("low", f"{vpath}/: {n}× {sev} {why} — vendored, identical "
+                      f"to {tree}, not gated (scan with no task to list them)"))
     found += [("high", f"{p}: dependency manifest changed — new_dependency")
               for p in paths if Path(p).name in manifests]
     # Informational only, deliberately never gating. path_globs are the §3
@@ -842,7 +1123,11 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except Exception as e:                # any crash is "could not look", never 1
+        die(f"internal error: {type(e).__name__}: {e}")
+    sys.exit(rc)
 ```
 ````
 
@@ -877,6 +1162,15 @@ loop:
   default_mode: L2
   max_tasks_per_cycle: 1
   max_slots: 2               # parallel worktrees, clamp [1,8]
+
+sandbox:
+  # Ignored dependency caches copied from the main checkout into each new
+  # worktree before dispatch (orch-task §3). `git worktree add` checks out
+  # tracked files only, so without these a build fetches from the network —
+  # which a `network: false` packet forbids. Only paths that exist are copied.
+  seed_caches: [.pio/libdeps, node_modules, vendor/bundle]
+  # NOT .venv: its scripts and any editable install point back at the main
+  # checkout, so tests would silently import main-tree code, not the task's.
 ```
 ````
 
@@ -908,14 +1202,25 @@ path_globs:
 content_patterns:
   - {severity: high,   why: credential material,        pattern: "(api[_-]?key|secret[_-]?key|password|passwd|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY)"}
   - {severity: high,   why: unsafe deserialization,     pattern: "pickle\\.loads?\\(|yaml\\.load\\((?!.*SafeLoader)|marshal\\.loads?\\("}
-  - {severity: medium, why: dynamic execution,          pattern: "\\beval\\(|\\bexec\\(|os\\.system\\(|shell=True"}
-  - {severity: medium, why: network client code,        pattern: "socket\\.socket\\(|requests\\.(get|post|put|delete)\\(|urllib\\.request|fetch\\("}
+  - {severity: medium, why: dynamic execution,          pattern: "\\beval\\(|(?-i:(?<![.\\w])exec\\()|os\\.system\\(|shell=True"}
+  - {severity: medium, why: network client code,        pattern: "socket\\.socket\\(|requests\\.(get|post|put|delete)\\(|urllib\\.request|(?-i:(?<![A-Za-z0-9_])fetch\\()"}
   - {severity: high,   why: destructive SQL,            pattern: "DROP TABLE|TRUNCATE TABLE|DELETE FROM .* WHERE 1"}
   - {severity: high,   why: irreversible operation,     pattern: "git push --force|rm -rf /|chmod 777"}
 
+# exec/fetch are case-exact and need a non-identifier left edge: `.exec(` is
+# RegExp matching and `performFetch(` is a method name; neither is the risk.
+
 # Any added line in these files is the `new_dependency` trigger, separately
-# from severity.
-dependency_manifests: [requirements.txt, pyproject.toml, package.json, go.mod, Cargo.toml, Gemfile, pom.xml]
+# from severity. Embedded/C++ build manifests are dependency surfaces too —
+# platformio.ini `lib_deps` was a real one that passed this list silently.
+dependency_manifests: [requirements.txt, pyproject.toml, package.json, go.mod, Cargo.toml, Gemfile, pom.xml, platformio.ini, library.json, CMakeLists.txt, conanfile.txt, conanfile.py, vcpkg.json, idf_component.yml]
+
+# Medium findings with these `why` values, in files under test_paths whose
+# added lines name no non-loopback http(s) host, report as low: a test calling
+# its own in-process server is not egress. One external URL in the file and
+# the finding gates as usual.
+test_paths: ["**/test/**", "**/tests/**", "**/__tests__/**", "**/*.test.*", "**/*_test.*", "**/test_*"]
+test_downgrade: [network client code]
 ```
 ````
 
@@ -1076,6 +1381,18 @@ cannot justify against the goal is scope creep and will be flagged.
 **Evidence.** Cite `file:line` for every claim about code. Report only commands
 you actually ran and their real exit codes. Never weaken, skip, or delete a
 test to make acceptance pass — if a test blocks you, that is a finding.
+
+**A wrong check is a finding, not a target.** Acceptance checks are written by
+the orchestrator and are sometimes wrong — a grep that also matches code the
+goal allows, a count miscounted against the base commit. If a check looks
+wrong, FLAG it in `open_questions` with the evidence and leave the check
+failing. Never edit code solely to make a grep or a count pass; a change whose
+only justification is the check is gaming it, however harmless it looks.
+
+**Working directory.** The packet names your worktree as an absolute path. It
+overrides whatever the environment reports as the primary working directory.
+Run `pwd` first; if it is not that path, `cd` to it before anything else, and if
+you cannot, end `blocked`.
 
 **Memory.** If a context block informed your work, cite its `blk_` id in an
 evidence entry. If you had to read a file you were not pointed at, say so in
@@ -1240,7 +1557,20 @@ For each proposed fact:
    source is a task id plus the trace or checkpoint that shows it. Write them
    `decay_class: permanent`; the constraint outlives the code.
 
+7. **Verify every `file:line` before writing it.** Memory is the one artifact
+   every future packet trusts, so a wrong citation outlives the task that made
+   it. For each code claim, read the cited line in the task's worktree or
+   branch and confirm the symbol the block names is actually there — a block
+   once blamed `MappedInputManager::loop()` for a bug in `TrmnlActivity::loop()`.
+   A claim that does not check out is not written; say so in your report.
+
 Write the block file, then append its line to `INDEX.md`. Newest first.
+
+**Receipt first, report second.** Before each block write, append one line to
+`.orch/memory/receipts/<task_id>.log`: `<ISO> new|update|supersede|discard
+blk_<id> <headline>`. If you are interrupted — a usage limit, a crash — every
+write you made is recoverable from the receipt instead of by diffing
+`INDEX.md`, and the orchestrator can tell a finished ingest from a partial one.
 
 **Compaction** (when a project passes `block_cap`, or on request):
 - merge near-duplicate clusters, unioning their sources
@@ -1417,6 +1747,10 @@ acceptance:
   - {type: judged, criterion: "root cause named with file:line"}
 context_refs: [blk_...]          # ids, not content
 scope: {paths: ["src/muxer.py", "tests/test_muxer.py"], network: false}
+expects: []                      # sensitive.yaml `why`s that ARE this task's subject,
+                                 # e.g. [network client code]; medium only (§5)
+vendored: []                     # - {path: "lib/x", tree: "<sha>[:subdir]"} — verbatim
+                                 # upstream, verified by tree hash at scan time
 tools: [read, grep, edit, "bash:test"]
 forbidden: [write:outside_scope, network, "git:push"]
 budget: {steps: 25, wall_s: 600}
@@ -1434,6 +1768,14 @@ is a value must say the value:
 | `exit 0` / `exit N` | the command's exit status, and nothing about its output |
 | `stdout == <value>` | stdout, stripped, equals this exactly — the form a count check takes |
 | `stdout matches /re/` | stdout matches the regex; use only when the exact string genuinely varies |
+| `delta == +k` | stdout at HEAD minus stdout at the base commit, both integers, equals `k` — for a count over a set that other tasks also grow |
+
+`delta` is **per-task acceptance only, never registered.** A total like
+`grep -c '^STR_' strings.yaml == 212` is exact and correct, but every feature
+that adds a string invalidates it, and one registry entry was superseded six
+times in one project. Accept the task on its delta; register an **invariant**
+instead (`every key defined is used`, `no key is duplicated`), which stays true
+as the set grows.
 
 Rules that are not negotiable:
 
@@ -1445,6 +1787,10 @@ Rules that are not negotiable:
   feature *exists*; correctness needs it to be *exactly right*, and those are
   different assertions. If you cannot predict the exact count, you do not yet
   understand the behaviour well enough to accept it.
+- **A count over an existing file is `count_at_BASE + delta`, measured.** Run
+  the check's command at the base commit before writing `N`, and say in the
+  packet which lines the delta is. A count guessed from reading the code is the
+  most common way a correct agent ends up facing a wrong check.
 - **Negative space needs its own check.** "Writes nothing to `output/`", "does
   not install anything", "leaves `config.yaml` untouched" are assertions and
   need commands, not prose. Absence is never verified by a check that only
@@ -1479,6 +1825,24 @@ librarian auto-attached go in too.
 git worktree add -b orch/<task_id> .work/<task_id> HEAD
 ```
 
+**Seed dependency caches** listed in `settings.yaml` `sandbox.seed_caches`.
+A worktree has tracked files only; without its caches a build fetches from the
+network, which a `network: false` packet forbids. Copy each one that exists in
+the main checkout, at any depth, and **say so in the dispatch prompt** — the
+agent must never fetch them itself:
+
+```bash
+git ls-files -oi --exclude-standard --directory \
+  | grep -E '(^|/)(\.pio/libdeps|node_modules|vendor/bundle)/$' \
+  | while read -r d; do mkdir -p ".work/<task_id>/$(dirname "$d")"
+      cp -a --reflink=auto "$d" ".work/<task_id>/$d"; done
+```
+
+A copied cache can hold absolute paths back to the main checkout (PlatformIO's
+`.pio-link` files, npm workspace symlinks). Grep the seeded copy for the main
+checkout's path; if a build would read through one, the build tests the wrong
+tree. Never seed a Python `.venv` — its editable install is exactly that.
+
 If the phase is `heavy: true`, multiply the playbook `default_budget` by its
 `heavy_budget_multiplier` **now**, before dispatch — a budget known in advance
 to be too small produces a spend checkpoint that carries no information, and
@@ -1489,6 +1853,19 @@ agent runs and before any cost**:
 - a `scope.paths` entry matches a `path_globs` pattern in `sensitive.yaml`
 - `attempts >= max_attempts` for this task
 - the task is `deferred_until` a future time
+- **the dispatch prompt names a command the guard blocks.** Write the prompt
+  to a file and lint it — it checks fenced blocks and inline code with the
+  guard's own matcher:
+
+  ```bash
+  python3 .claude/hooks/orch-guard.py --lint <prompt-file>   # exit 1 = hits
+  ```
+
+  A guarded step in a prompt is blocked mid-run and costs a whole attempt with
+  zero progress — a cleanup `rm -rf` of the task's own gitignored build dir did
+  exactly that. Take it out (a build tool's `clean` target, or no cleanup at
+  all), or, if it is genuinely needed, this is the checkpoint: raise it now,
+  before any cost. There is no scope-aware exemption in the guard, on purpose.
 
 ## 4. Dispatch
 
@@ -1497,7 +1874,17 @@ Spawn the subagent named by the phase's `role` (`orch-executor`,
 
 - the packet's goal, acceptance, scope, forbidden
 - the retrieved blocks as `[blk_id] (type) headline / summary / body`
-- `Work only inside .work/<task_id>. It is a throwaway worktree.`
+- `Work only inside <absolute path to .work/<task_id>>. It is a throwaway
+  worktree. This path overrides the session's primary working directory.`
+- `If a check looks wrong, FLAG it — do not edit code solely to make it pass.`
+
+**Return the orchestrator shell to the repo root before every dispatch**
+(`cd "$(git rev-parse --path-format=absolute --git-common-dir)/.."` works from
+inside any worktree; `--show-toplevel` does not — it returns the worktree). A subagent inherits the orchestrator's cwd as its primary working
+directory: `cd` into worktree A to place fixtures, then dispatch task B, and B's
+agent starts in A. Scope enforcement does not catch that when A's and B's paths
+do not overlap — the writes land in a legitimate worktree, just the wrong one.
+State the worktree as an absolute path, never `.work/<id>` relative.
 
 Set `ORCH_TASK=<task_id>` in the environment for bash calls so the guard hook
 can enforce scope.
@@ -1510,9 +1897,15 @@ The subagent's claimed status is an input, not the answer.
    BEFORE running acceptance checks — otherwise the checks' own byproducts
    (`__pycache__`, `.pytest_cache`, build output, lockfiles) look like agent
    writes and false-positive as scope creep. Filter generated artifacts out.
-2. **Commit** with an `Orch-Task:` trailer. Stage explicit paths with `--force`,
-   never `git add -A`:
+2. **Commit** with an `Orch-Task:` trailer. Stage the **files** step 1
+   captured, by explicit path — never `git add -A`, and never a directory.
+   `--force` only for a path step 1 reported as ignored-but-intended (a
+   vendored tree whose own `.gitignore` hides real upstream files); applied to
+   a directory it overrides every nested `.gitignore` and commits build output.
+   Then look at what is staged before committing:
    ```bash
+   git -C .work/<id> add -- <file> <file> ...
+   git -C .work/<id> diff --cached --stat        # no build output, no caches
    git -C .work/<id> commit -m "<summary>" -m "Orch-Task: <task_id>"
    ```
 3. **Run every executable check** inside the worktree. A `done` whose check
@@ -1534,8 +1927,16 @@ The subagent's claimed status is an input, not the answer.
    and path-glob checks are one command:
 
    ```bash
-   python3 .claude/hooks/orch-scan.py .work/<id> <sha-at-worktree-creation>
+   python3 .claude/hooks/orch-scan.py .work/<id> <sha-at-worktree-creation> --task <task_id>
    ```
+
+   `--task` makes the scan honour two packet fields the user already
+   confirmed: `expects:` (medium findings that are the task's own subject —
+   a network client task adds network code — report as low; high never does)
+   and `vendored:` (findings under a path that git proves byte-identical to a
+   pinned upstream tree are summarised, not gated; a claim that does not hold
+   is itself a high finding). Medium network findings in test files that name
+   no external host are low by policy (`sensitive.yaml` `test_downgrade`).
 
    The base ref defaults to `HEAD^`, which is right only when the task produced
    exactly one commit. Pass the sha the worktree was branched from (§3) and it
@@ -1564,7 +1965,9 @@ On a clean `done`:
   the reason. Silently outnumbering a weak check with better ones leaves it in
   the registry as passing evidence at the commit where the behaviour was wrong
   (`/orch-rework` §3)
-- dispatch `orch-archivist` with `new_facts`
+- dispatch `orch-archivist` with `new_facts` and the worktree's absolute path
+  (it verifies every `file:line` there, so dispatch before pruning). If it is
+  interrupted, `.orch/memory/receipts/<task_id>.log` says what landed
 - write `.orch/traces/trc_<id>.json`, **including `orchestrator_error`** — the
   key is always present, `null` only if the packet was genuinely right. It is
   the machine-readable half of the summary's `attribution`, it is never scored,
@@ -1863,6 +2266,9 @@ git worktree add --detach .work/_sweep HEAD
 # for each check in .orch/registry/<project>.yaml: run it in .work/_sweep
 git worktree remove --force .work/_sweep
 ```
+
+Only invariants belong here. A `delta == +k` check (`orch-task` §1) is
+meaningless at any commit but its own and is never registered.
 
 Run `status: active` checks only. `quarantined`, `exempt` and **`superseded`**
 are skipped — a superseded check asserted the wrong thing, so neither its pass
@@ -2228,9 +2634,95 @@ for c in 'bash -c "git push --force"' 'echo $(git push --force)' \
 done
 ```
 
+```bash
+# 9. policy root must not follow CLAUDE_PROJECT_DIR into a worktree. It does
+#    in practice, and .orch/ is not there — the scan exited 2 on every task and
+#    the guard read no policy. Tested with .orch/ and .claude/ absent from the
+#    worktree, the gitignored layout where it first bit.
+git add -A && git commit -qm base && base=$(git rev-parse HEAD)
+git worktree add -q .work/tsk_w -b orch/tsk_w HEAD && rm -r .work/tsk_w/.orch .work/tsk_w/.claude
+( cd .work/tsk_w && echo 'x = 1' > ok.py && git add ok.py && git commit -qm w )
+CLAUDE_PROJECT_DIR=$PWD/.work/tsk_w python3 .claude/hooks/orch-scan.py .work/tsk_w $base
+echo "drifted scan exit=$? (want 0)"
+echo '{"tool_name":"Edit","tool_input":{"file_path":".orch/config/settings.yaml"}}' \
+  | CLAUDE_PROJECT_DIR=$PWD/.work/tsk_w python3 .claude/hooks/orch-guard.py 2>/dev/null
+echo "drifted guard config-write exit=$? (want 2)"
+
+# 10. a non-UTF-8 diff is scanned, not crashed on. A crash used to exit 1,
+#     the "findings" code.
+( cd .work/tsk_w && printf 'a\xe2\x28b\n' > bin.dat && git add bin.dat && git commit -qm bin )
+python3 .claude/hooks/orch-scan.py .work/tsk_w $base; echo "binary diff exit=$? (want 0)"
+python3 .claude/hooks/orch-scan.py .work/tsk_w no-such-ref 2>/dev/null; echo "bad ref exit=$? (want 2)"
+git worktree remove --force .work/tsk_w && git branch -qD orch/tsk_w
+```
+
+```bash
+# 11. quoted heredoc bodies are data (up_0005) — and the strip is not an
+#     evasion. A body fed to a shell, an unquoted heredoc, and an operator
+#     hidden in quotes or a comment must all still block.
+j() { python3 -c "import json,sys;print(json.dumps({'tool_name':'Bash','tool_input':{'command':sys.argv[1]}}))" "$1" \
+      | python3 .claude/hooks/orch-guard.py >/dev/null 2>&1; echo "$2 exit=$? (want $3)"; }
+B='blocked `rm -rf a/b` and git push --force'
+j "cat > x.md <<'EOF'
+$B
+EOF"                                          "quoted -> file"     0
+j "cat > x.md <<\"EOF\"
+$B
+EOF"                                          "dquoted -> file"    0
+j "cat > x.md <<EOF
+$B
+EOF"                                          "unquoted"           2
+j "cat <<'EOF' | bash
+git push --force
+EOF"                                          "quoted -> bash"     2
+j "echo \"<<'Y'\"
+git push --force
+Y"                                            "op inside quotes"   2
+j "ls # <<'Y'
+git push --force
+Y"                                            "op inside comment"  2
+j "cat > x <<'A'
+text
+A
+git push --force"                             "after the body"     2
+
+# 12. prompt lint uses the guard's matcher (up_0006)
+printf 'Build it.\n```bash\nmake\nrm -rf build\n```\nThen run `git push`.\n' > p.md
+python3 .claude/hooks/orch-guard.py --lint p.md </dev/null >/dev/null; echo "lint hits exit=$? (want 1)"
+printf 'Run `make test` and report.\n' > p.md
+python3 .claude/hooks/orch-guard.py --lint p.md </dev/null >/dev/null; echo "lint clean exit=$? (want 0)"
+rm p.md
+
+# 13. content patterns: exact where it matters (up_0008, up_0011), manifests
+#     (up_0003), test-path downgrade, packet expects and vendored (up_0004).
+sc() { git add -A && git commit -qm "$1" && python3 .claude/hooks/orch-scan.py . HEAD^ $3 >/dev/null 2>&1; echo "$1 exit=$? (want $2)"; }
+git add -A && git commit -qm pre >/dev/null
+echo 'void performFetch();'                    > a.cpp; sc "performFetch("       0
+echo 'm = RE.exec(text); n = /x/.exec(s)'      > a.js;  sc "regex .exec("        0
+echo 'exec(code)'                              > b.py;  sc "python exec("        1
+echo 'r = fetch(url)'                          > b.js;  sc "fetch(url)"          1
+printf '[env]\nlib_deps = foo\n'      > platformio.ini; sc "platformio.ini"      1
+mkdir -p tests && echo 'await fetch(`${base}/v1`)' > tests/api.test.js;  sc "loopback test" 0
+echo 'await fetch("https://example.com/x")'  >> tests/api.test.js;       sc "external in test" 1
+printf 'task_id: tsk_n\nscope: {paths: ["*"]}\nexpects: [network client code]\n' > .orch/queue/tsk_n.yaml
+echo 'r = fetch(u)' > c.js;                        sc "expects network"      0 "--task tsk_n"
+# the upstream tree is built as a bare object, never committed: if it came
+# from history, git would diff the vendored copy as a rename with no added
+# lines, and this test would pass on code with no vendoring support at all
+b=$(echo 'password = "x"' | git hash-object -w --stdin)
+t=$(printf '100644 blob %s	p.py
+' $b | git mktree)
+mkdir -p lib/v && echo 'password = "x"' > lib/v/p.py
+printf 'task_id: tsk_v\nscope: {paths: ["*"]}\nvendored:\n  - {path: "lib/v", tree: "%s"}\n' $t > .orch/queue/tsk_v.yaml
+sc "vendored identical" 0 "--task tsk_v"
+echo 'password = "y"' > lib/v/q.py;                sc "vendored differs"     1 "--task tsk_v"
+```
+
 Expected: the usage line and `exit=0` in step 1b (the scan's own invocation
 carries no policy literal, so the guard lets it through), 4 blocks in step 2,
-allow in step 3, `0 2 0 2 2` in step 4, and step 5 printing `loosening ignored`.
+allow in step 3, `0 2 0 2 2` in step 4, step 5 printing `loosening ignored`,
+`0 2 0 2` in steps 9–10, and every line of steps 11–13 printing its `want`. Before the fix, step 9's scan exits 2 (`no policy`)
+and step 10's exits **1** on a `UnicodeDecodeError`, which is the findings code.
 
 Step 4 is the one to actually read. Scope enforcement fails **silently** when it
 fails: a packet the guard cannot parse produces no error, no log line, and no
