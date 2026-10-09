@@ -11,7 +11,8 @@ plain files. Same architecture, no Python package, no database, no daemon.
 Deterministic — copy `ORCH.md` into the repo root and run this. It extracts the
 28 `FILE:` blocks in §5 verbatim; no model is in the loop, so nothing can be
 paraphrased. Safe to re-run: it is how you **update** an install, not just create
-one.
+one. It also removes files an earlier version shipped and this one retired
+(v6.1: `orch-executor-deep.md`).
 
 What it will and will not overwrite:
 
@@ -19,7 +20,8 @@ What it will and will not overwrite:
 |---|---|
 | `.claude/` agents, skills, hooks | replaced from `ORCH.md` — these are generated, not yours |
 | `CLAUDE.md` | the `<!-- ORCH … -->`…`<!-- /ORCH -->` block is **replaced in place**, by version; the rest of your file is untouched |
-| `.claude/settings.json` | hook entries merged, never clobbered |
+| `.claude/settings.json` | hook entries merged, never clobbered (including the two worktree hooks; `--no-isolation` leaves them out) |
+| `~/.claude/settings.json` | **one** `autoMode.environment` line merged in, backup beside it — the only write outside the repo; `--no-user-automode` skips it |
 | `.orch/memory/`, `state.json`, `upstream.md`, queue/registry/traces | never touched — your data |
 | `.orch/config/*.yaml`, `.orch/playbooks/*.yaml` | **not** overwritten (you are meant to tighten thresholds and edit playbooks) — but drift is **reported**, and the shipped version is written beside it as `*.new` to diff |
 
@@ -32,12 +34,20 @@ import json, pathlib, re, sys
 
 src = pathlib.Path(sys.argv[1]).read_text()
 check = "--check" in sys.argv[2:]
+isolation = "--no-isolation" not in sys.argv[2:]          # default on: harness-isolated executor worktrees
+user_automode = "--no-user-automode" not in sys.argv[2:]  # default on: writes ~/.claude/settings.json
 blocks = []
 for chunk in re.findall(r"^````\n(.*?)^````\n", src, re.S | re.M):
     m = re.match(r"FILE: (\S+)[^\n]*\n```\w*\n(.*)\n```\n?\Z", chunk, re.S)
     if m:
         blocks.append((m.group(1), m.group(2)))
 assert len(blocks) == 28, f"expected 28 FILE blocks, found {len(blocks)}"
+
+# Files an earlier ORCH shipped and this one does not. They are generated, never
+# yours, and a stale agent definition is still REGISTERED by Claude Code, so
+# leaving one behind is a live agent nobody dispatches. (v6.1: effort is a
+# dispatch parameter now; orch-executor-deep is gone.)
+RETIRED = (".claude/agents/orch-executor-deep.md",)
 
 # Your data: never compared, never touched once it exists. Everything ELSE under
 # .orch/ is an ORCH-owned template — also never overwritten (thresholds and
@@ -123,9 +133,61 @@ for path, body in blocks:
         stale.append(note)
     print(f"{verb:<6} {note}")
 
+ISOLATION_HOOKS = {
+    "WorktreeCreate": [{"hooks": [{"type": "command",
+        "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/orch-worktree.py\" create"}]}],
+    "WorktreeRemove": [{"hooks": [{"type": "command",
+        "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/orch-worktree.py\" remove"}]}],
+}
+AUTOMODE_ENTRY = ("Orchestration repos: a project's .claude/hooks/orch-*.py scripts are its own tooling, and "
+                  ".work/<id>/ directories are throwaway git worktrees it creates. Subagents deliver their "
+                  "reports through SubagentHandback; that is expected.")
+
+if isolation:
+    sp = pathlib.Path(".claude/settings.json")
+    if check:
+        have = json.loads(sp.read_text()).get("hooks", {}) if sp.exists() else {}
+        miss = [e for ev, es in ISOLATION_HOOKS.items() for e in es if e not in have.get(ev, [])]
+        if miss:
+            stale.append(f".claude/settings.json missing {len(miss)} isolation hook entry")
+            print(f"STALE  .claude/settings.json missing {len(miss)} isolation hook entry")
+    else:
+        merge_json(sp, {"hooks": ISOLATION_HOOKS})
+        print("merge  .claude/settings.json (isolation hooks; remove them to undo)")
+
+if user_automode:
+    # The classifier reads autoMode only from USER settings, never the repo's. This is the one
+    # thing the installer writes outside the repo, and only when asked. It adds one
+    # `environment` line and keeps everything else; no allow or deny rule is touched.
+    up = pathlib.Path.home() / ".claude" / "settings.json"
+    cur = json.loads(up.read_text()) if up.exists() else {}
+    env = cur.setdefault("autoMode", {}).setdefault("environment", ["$defaults"])
+    if AUTOMODE_ENTRY in env:
+        print(f"same   {up} (autoMode.environment)")
+    elif check:
+        print(f"note   {up} lacks the ORCH autoMode.environment line (optional)")
+    else:
+        if up.exists():
+            import shutil, time
+            shutil.copy2(up, f"{up}.orch-bak-{int(time.time())}")
+        env.append(AUTOMODE_ENTRY)
+        up.parent.mkdir(parents=True, exist_ok=True)
+        up.write_text(json.dumps(cur, indent=2) + "\n")
+        print(f"merge  {up} (autoMode.environment, one line; backup beside it)")
+
+for path in RETIRED:
+    p = pathlib.Path(path)
+    if p.exists():
+        if check:
+            stale.append(f"{path} is retired — re-run the installer to remove it")
+            print(f"STALE  {path} (retired)")
+        else:
+            p.unlink()
+            print(f"retire {path}")
+
 if not check:
     for h in ("orch-guard.py", "orch-scan.py", "orch-lint.py", "orch-task.py", "orch-stage.py",
-              "orch-measure.py", "orch-report.py"):
+              "orch-measure.py", "orch-report.py", "orch-worktree.py"):
         (pathlib.Path(".claude/hooks") / h).chmod(0o755)
     pathlib.Path(".work").mkdir(exist_ok=True)
     # git does not track empty dirs; .gitkeep keeps the layout intact on clone
@@ -255,9 +317,11 @@ Honestly lossy, and you should know which parts:
 
 ### 1.2 Scope: this is repo-local, and stays that way
 
-Every path the installer writes is relative to the repo root. It never writes
-to `~/.claude/`, never touches your global settings, agents, skills, or
-`CLAUDE.md`, and contains no absolute or `..` paths.
+Every path the installer writes is relative to the repo root, with one
+exception since v6.1: it merges one `autoMode.environment` line into
+`~/.claude/settings.json` (below; `--no-user-automode` skips it). It never
+touches your global agents, skills, hooks or `CLAUDE.md`, and contains no
+absolute or `..` paths.
 
 | | global (`~/.claude/`) | this repo |
 |---|---|---|
@@ -295,6 +359,22 @@ Three consequences worth knowing before you install:
   collaborators get these hooks. That is usually what you want for a team
   orchestration layer. If you want the hooks for yourself only, move the
   `hooks` block to `.claude/settings.local.json` (personal, gitignored).
+- **Two things the installer does by default since v6.1; each has an opt-out.**
+  (a) It merges ONE line into `autoMode.environment` in `~/.claude/settings.json`
+  (backup beside it; `$defaults` kept; no allow or deny rule touched;
+  `--no-user-automode` skips it). It is the only thing the installer writes
+  outside the repo, and it has to be there: auto mode's classifier reads
+  `autoMode` only from user settings, managed settings or `--settings`, never
+  from `.claude/settings.json`. It reads `CLAUDE.md` too, which already carries
+  the §2 core. The line tells the classifier what ORCH's own tooling is; it does
+  not widen what it allows. It applies to every project you open, not this one.
+  (b) It wires `WorktreeCreate`/`WorktreeRemove` to `orch-worktree.py` (§5.1) so
+  Claude Code's `isolation: "worktree"` can run an executor inside the worktree
+  ORCH made (`--no-isolation` leaves the hooks out). Left to itself that feature
+  would put the worktree under `.claude/worktrees/` on a branch off the default
+  branch and disarm the guard's path-based scope; the hook is what prevents
+  that. With it, `claude --worktree` in this repo gets a plain worktree made by
+  the hook, from `HEAD`, not the default branch.
 - **Project hooks require your approval.** Claude Code will not silently run a
   hook a repo just added; you review it on first load. Expect that prompt.
 
@@ -366,8 +446,7 @@ your own recurring packet defects. Architecture: `ORCH.md`.
 ```
 .claude/
   agents/                     # subagent definitions — never in main context
-    orch-executor.md          # writes code, sonnet, effort medium
-    orch-executor-deep.md     # the same contract at effort high — chosen by the packet
+    orch-executor.md          # writes code, sonnet; effort is passed per dispatch (§4), by the packet
     orch-debugger.md          # reproduces + isolates, sonnet, effort high
     orch-reviewer.md          # verifies against acceptance, sonnet, effort high
     orch-librarian.md         # selects memory blocks, haiku
@@ -386,6 +465,7 @@ your own recurring packet defects. Architecture: `ORCH.md`.
   hooks/orch-stage.py         # long jobs as resumable stages, one background job each
   hooks/orch-measure.py       # paired / matched-abstention / identity comparisons over per-item rows
   hooks/orch-report.py        # agent reports: held to their contract as they leave, recorded by code
+  hooks/orch-worktree.py      # hands Claude Code's isolated subagent the worktree ORCH made
   settings.json               # hook wiring (merge, don't clobber)
 .orch/
   config/settings.yaml        # thresholds — tightening only
@@ -1536,6 +1616,10 @@ def policy():
             except re.error as e:
                 die(f"unparseable pattern {raw!r}: {e}")
             continue
+        m = re.match(r'^data_keep\s*:\s*"(.*)"\s*(#.*)?$', line)
+        if m:
+            lists["data_keep"] = [m.group(1).replace("\\\\", "\\")]      # YAML double-quoted
+            continue
         m = re.match(r"^(\w+)\s*:\s*\[(.*)\]\s*(#.*)?$", line)
         if m:
             lists[m.group(1)] = flow_list(m.group(2))
@@ -1651,6 +1735,8 @@ def main():
     external = {p for p, t in lines for h in URL_HOST.findall(t)
                 if not LOOPBACK.match(h)}
     test_paths, test_down = lists.get("test_paths", []), lists.get("test_downgrade", [])
+    data_paths, data_down = lists.get("data_paths", []), lists.get("data_downgrade", [])
+    keep = re.compile(lists["data_keep"][0], re.I) if lists.get("data_keep") else None
 
     vend_hits = {}
     for path, text in lines:
@@ -1669,6 +1755,9 @@ def main():
             elif (sev == "medium" and why in test_down and path
                   and hits(path, test_paths) and path not in external):
                 sev, note = "low", " [test path, no external host]"
+            elif (why in data_down and path and hits(path, data_paths)
+                  and not (keep and keep.search(text))):
+                sev, note = "low", " [data file, no assignment shape]"
             found.append((sev, f"{path}: {why}{note} — {text.strip()[:110]}"))
     for ((vpath, tree), sev, why), n in sorted(vend_hits.items()):
         found.append(("low", f"{vpath}/: {n}× {sev} {why} — vendored, identical "
@@ -2361,7 +2450,7 @@ def lint_packet(path, prompts, do_measure, timeout):
 
     effort = scalar(txt, "effort")
     if effort and effort not in ("medium", "high"):
-        report("error", f"effort: {effort} — medium (orch-executor) or high (orch-executor-deep)")
+        report("error", f"effort: {effort} — medium or high (passed to orch-executor at dispatch)")
     checks = [(n, e) for n, e in enumerate(entries, 1) if e.get("type", "executable") != "judged"]
     if role == "executor" and not checks:
         report("error", "an executor packet with judged acceptance only — executable beats judged")
@@ -3130,6 +3219,9 @@ def cmd_prompt(tid):
     have = [n for n in names if (wt / n).exists()]
     out += ["", (f"Dependency caches seeded from the main checkout: {', '.join(have)}. " if have else "")
             + "Never fetch dependencies yourself."]
+    out += ["", f"Scratch files (generators, probes, intermediate output) go in a directory whose name is "
+            f"your task id, `{tid}`, under your session's scratchpad — never at a name another task could "
+            "also pick (`gen.py`, `tmp/`), never inside the worktree unless the scope lists them."]
     if pk["refs"]:
         out += ["", "## Context — memory blocks", ""]
         for b in pk["refs"]:
@@ -4032,7 +4124,7 @@ wrote the result file itself, and `verify` could not tell it from an agent's
 (up_0013). The archivist reported "complete" over 58 lint errors.
 
 So the contract is checked where the report leaves the agent:
-  executor, executor-deep, debugger, reviewer   one JSON object with `status`
+  executor, debugger, reviewer (and executor-deep, retired in v6.1)   one JSON object with `status`
   judge                                         and `task_id` (judge: `msr_id`)
   archivist   `orch-lint.py memory --task <id>` exits 0 for the id it names
 A report that breaks it is refused (exit 2): the handback call is denied, or
@@ -4295,6 +4387,152 @@ And `status` labels its total `ALL` and prints this session's beside it: a
 project total of 23.72 hours, 13.53 of them from before the session, once
 reached the user as the session's GPU time. `status --new` lets a stale
 wakeup answer in one line.
+
+#### Harness-isolated worktrees (v6.1)
+
+Claude Code can run a subagent in a worktree of its own (`isolation: "worktree"`),
+and enforces it: the subagent's edits and commands that resolve to the main
+checkout are refused by the harness. That reaches what ORCH could not — a write
+made through Bash outside the worktree (`up_0006`). By default it is not usable
+here: Claude Code puts the worktree under `.claude/worktrees/`, branches it from
+the default branch, and the `WorktreeCreate` hook that can replace this receives
+only a slug name. So the installer wires the hook (`--no-isolation` skips it),
+and the task is chosen by a marker. `orch-worktree.py arm <id>` marks
+`.work/<id>` as the one worktree to hand out; the hook returns that path to the
+dispatch that follows, and the guard's path-based scope, the `orch/<id>` branch
+and the recorded base are all untouched, because the worktree is the one ORCH
+made. `orch-task` §4 has the procedure. **One dispatch at a time**: two armed
+markers fail the create rather than guess. With nothing armed the hook makes the
+plain worktree the default would, from `HEAD`. Not run against a live Claude Code
+yet (HANDOFF row 44).
+
+````
+FILE: .claude/hooks/orch-worktree.py
+```python
+#!/usr/bin/env python3
+"""ORCH worktree hook (installed by default; installer --no-isolation skips it). Lets Claude Code's own
+subagent isolation (`isolation: "worktree"`) run inside the worktree ORCH made.
+
+    orch-worktree.py arm <task_id>      orchestrator: .work/<id> may be claimed, once
+    orch-worktree.py disarm <task_id>   orchestrator: drop the marker after dispatch
+    orch-worktree.py create             WorktreeCreate hook (stdin: JSON with `name`)
+    orch-worktree.py remove             WorktreeRemove hook (stdin: JSON with `worktree_path`)
+
+Why a hook at all: Claude Code creates an isolated subagent worktree under
+.claude/worktrees/, on a branch off the default branch. ORCH needs the worktree
+at .work/<task_id> (the guard resolves scope from that path), the branch
+orch/<task_id> and a recorded base. The create hook gets only a slug `name`, no
+task id, so the task is chosen by a marker the orchestrator writes first.
+
+One task armed at a time: two parallel dispatches could not be told apart, so
+two armed markers fail the create (exit 2) rather than guess. With none armed
+the hook does what the default does, from HEAD, so `claude --worktree` still
+works in a repo that installed it. Remove never deletes under .work/ — `finish`
+prunes those, after verify and the archivist have looked at them.
+"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def git(*a, cwd=None):
+    return subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True)
+
+
+def repo_root(hint=None):
+    for d in (os.environ.get("CLAUDE_PROJECT_DIR"), hint, os.getcwd()):
+        if not d:
+            continue
+        r = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=d)
+        if r.returncode == 0:
+            return Path(r.stdout.strip()).parent
+    sys.exit("orch-worktree: not inside a git repository")
+
+
+def iso_dir(root):
+    d = root / ".work" / "_isolation"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def arm(task_id):
+    root = repo_root()
+    wt = root / ".work" / task_id
+    if not (wt / ".git").exists():
+        sys.exit(f"orch-worktree: {wt} is not a worktree — `git worktree add -b orch/{task_id} .work/{task_id} <base>` first")
+    br = git("rev-parse", "--abbrev-ref", "HEAD", cwd=wt).stdout.strip()
+    if br != f"orch/{task_id}":
+        sys.exit(f"orch-worktree: {wt} is on {br!r}, not orch/{task_id}")
+    d = iso_dir(root)
+    others = [p.stem for p in d.glob("*.armed") if p.stem != task_id]
+    if others:
+        sys.exit(f"orch-worktree: {others[0]} is still armed — one dispatch at a time (disarm it, or dispatch it first)")
+    (d / f"{task_id}.claimed").unlink(missing_ok=True)
+    (d / f"{task_id}.armed").write_text(str(wt) + "\n")
+    print(f"armed {task_id}: dispatch the executor with isolation: \"worktree\" now, alone")
+
+
+def disarm(task_id):
+    d = iso_dir(repo_root())
+    for ext in ("armed", "claimed"):
+        (d / f"{task_id}.{ext}").unlink(missing_ok=True)
+    print(f"disarmed {task_id}")
+
+
+def create():
+    ev = json.load(sys.stdin)
+    root = repo_root(ev.get("cwd"))
+    d = iso_dir(root)
+    armed = sorted(d.glob("*.armed"))
+    if len(armed) > 1:
+        sys.stderr.write("ORCH: " + ", ".join(p.stem for p in armed) + " are all armed — "
+                         "the hook cannot tell which dispatch this is. Dispatch one at a time.\n")
+        sys.exit(2)
+    if armed:
+        path = armed[0].read_text().strip()
+        if not Path(path).is_dir():
+            sys.stderr.write(f"ORCH: armed worktree {path} no longer exists\n")
+            sys.exit(2)
+        armed[0].rename(armed[0].with_suffix(".claimed"))
+        print(path)
+        return
+    # nothing armed: not an ORCH dispatch. Do what the default does, from HEAD.
+    name = ev.get("name") or "worktree"
+    path = root / ".claude" / "worktrees" / name
+    r = git("worktree", "add", "-b", f"worktree-{name}", str(path), "HEAD", cwd=root)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(1)
+    sys.stderr.write("ORCH: no task armed — created a plain worktree from HEAD\n")
+    print(path)
+
+
+def remove():
+    ev = json.load(sys.stdin)
+    path = Path(ev.get("worktree_path") or "").resolve()
+    root = repo_root(ev.get("cwd"))
+    if not str(path):
+        return
+    if (root / ".work").resolve() in path.parents:
+        return                                  # ORCH's: `finish` prunes it
+    r = git("worktree", "remove", "--force", str(path), cwd=root)
+    if r.returncode != 0 and path.exists():
+        sys.stderr.write(r.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd in ("arm", "disarm") and len(sys.argv) == 3:
+        {"arm": arm, "disarm": disarm}[cmd](sys.argv[2])
+    elif cmd in ("create", "remove"):
+        {"create": create, "remove": remove}[cmd]()
+    else:
+        sys.exit(__doc__)
+```
+````
 
 ````
 FILE: .claude/hooks/orch-stage.py
@@ -5279,6 +5517,16 @@ dependency_manifests: ["requirements*.txt", "*.requirements.txt", "constraints*.
 # the finding gates as usual.
 test_paths: ["**/test/**", "**/tests/**", "**/__tests__/**", "**/*.test.*", "**/*_test.*", "**/test_*"]
 test_downgrade: [network client code]
+
+# Eval and fixture data is text ABOUT credentials, not credential material: a
+# question that says "reset my password" is a row, not a leak (slm up_0007: three
+# false checkpoints and two user turns). In files under data_paths, findings with
+# a `why` in data_downgrade report as low unless the added line is
+# assignment-shaped (`"password": "x1y2z3w4"`, `api_key = abc123`) or holds a
+# private-key header (data_keep). The same line in code still gates.
+data_paths: ["**/data/**", "**/fixtures/**", "**/*.jsonl"]
+data_downgrade: [credential material]
+data_keep: "(api[_-]?key|secret[_-]?key|password|passwd)['\\x22]?\\s*[:=]\\s*['\\x22]?[^\\s,'\\x22]{6,}|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY"
 ```
 ````
 
@@ -5418,7 +5666,6 @@ name: orch-executor
 description: Executes one phase of an orchestrated task inside a sandboxed git worktree — writes the minimal change for a stated goal, within a declared scope, and reports a structured result packet. Use for `fix`, `implement`, and `regression` phases.
 tools: Read, Grep, Glob, Edit, Write, Bash
 model: sonnet
-effort: medium
 ---
 
 You execute ONE phase of an orchestrated task. You are stateless: the packet
@@ -5500,102 +5747,15 @@ is the system working, so do not inflate it.
 ```
 ````
 
-`orch-executor-deep` is the same agent at `effort: high`. Effort is fixed per
-agent type — set in frontmatter, overriding the session's level — and the
-Agent tool has no per-dispatch effort parameter (it has one for `model`). So
-the only way to choose effort per task is to choose the agent. Its body is
-byte-identical to `orch-executor`'s, and tier-1 step 17 fails if the two
-drift: two copies of one contract that disagree are two contracts.
-
-````
-FILE: .claude/agents/orch-executor-deep.md
-```markdown
----
-name: orch-executor-deep
-description: The orch-executor contract at high reasoning effort. Dispatch it only when a packet says `effort: high` — multi-module changes, a retry after a failed attempt, or logic where a shallow reading fails silently.
-tools: Read, Grep, Glob, Edit, Write, Bash
-model: sonnet
-effort: high
----
-
-You execute ONE phase of an orchestrated task. You are stateless: the packet
-you were given is all the context that exists.
-
-**Sandbox.** Work only inside the current directory — it is a throwaway git
-worktree. Never `cd` out of it, never push, never touch the user's live tree.
-
-**Scope.** Modify only paths matching the packet's `scope.paths`. If the fix
-genuinely lives outside that scope, do not expand it: end `escalate` and name
-the file and line where the real fix belongs. Refusing to exceed scope is a
-correct outcome, not a failure — an agent that quietly widened its scope would
-be worse than one that stopped.
-
-**Out-of-scope files are read-only, even for a moment.** Do not edit one to try
-something and then restore it. A net-zero edit is still an out-of-scope write,
-the guard cannot see one made through Bash, and mutation checks are the
-orchestrator's job. If an experiment needs such an edit, ask in `open_questions`.
-
-**Never `git stash`.** The stash stack belongs to the repository, not the
-worktree: every task running in parallel shares it, and a `pop` in one can
-apply another task's changes.
-
-**Refused by the platform is not failed.** If tool calls are refused and the
-refusal is not the ORCH guard's (its message starts `ORCH checkpoint`) — a
-permission prompt, a classifier error, every command failing the same way —
-stop at once. Do not retry in a loop or switch tools to get around it. End
-`blocked` with `blocked_on: platform`, listing what you wrote and what you had
-already validated, so the same agent can resume where it stopped.
-
-**Minimality.** Apply the smallest change that satisfies the goal. No drive-by
-refactors, no reformatting, no "while I was here". Every changed line you
-cannot justify against the goal is scope creep and will be flagged.
-
-**Evidence.** Cite `file:line` for every claim about code. Report only commands
-you actually ran and their real exit codes. Never weaken, skip, or delete a
-test to make acceptance pass — if a test blocks you, that is a finding.
-
-**A wrong check is a finding, not a target.** Acceptance checks are written by
-the orchestrator and are sometimes wrong — a grep that also matches code the
-goal allows, a count miscounted against the base commit. If a check looks
-wrong, FLAG it in `open_questions` with the evidence and leave the check
-failing. Never edit code solely to make a grep or a count pass; a change whose
-only justification is the check is gaming it, however harmless it looks.
-
-**Working directory.** The packet names your worktree as an absolute path. It
-overrides whatever the environment reports as the primary working directory.
-Run `pwd` first; if it is not that path, `cd` to it before anything else, and if
-you cannot, end `blocked`.
-
-**Memory.** If a context block informed your work, cite its `blk_` id in an
-evidence entry. If you had to read a file you were not pointed at, say so in
-`open_questions` — that is a retrieval miss and it is useful.
-
-**Commit** with the trailer line your prompt gives, exactly as written — it is
-how bisect names this task later.
-
-**Your report is one JSON object, and code reads it.** If this run has the
-SubagentHandback tool, the object is that call's `message`; otherwise it is
-your final message. Nothing else goes in it — no prose before or after it, no
-code fence; your prose goes in `summary`. A hook checks the report as it leaves
-you and refuses one without the object, with the reason: a prose report costs
-you a retry, and costs the task its verification.
-
-{"task_id": "tsk_…",
- "status": "done|blocked|needs_decision|failed|escalate",
- "blocked_on": null,
- "summary": "one or two sentences, file:line for code claims",
- "evidence": [{"cite": "file:line", "reason": "..."}, {"check": "cmd", "exit": 0}],
- "confidence": 0.0,
- "new_facts": [{"type": "fact|failure", "headline": "<=15 words"}],
- "open_questions": []}
-
-`task_id` is the id at the top of your prompt. `confidence` is your honest
-posterior that this passes review. Below 0.6 forces a human checkpoint — that
-is the system working, so do not inflate it.
-`blocked_on` is `null` unless `status` is `blocked`; then it is `platform` or
-`dependency` (something the packet needs does not exist yet).
-```
-````
+Effort is chosen per dispatch, not per agent. Through v6 it was fixed in
+frontmatter, which overrides the session's level, and the Agent tool had no
+effort parameter — so a second agent file, `orch-executor-deep`, was a byte-copy
+of this one at `effort: high`. Claude Code 2.1.292 added the parameter, so v6.1
+passes `effort` when it dispatches and ships one executor. **This file has no
+`effort:` line on purpose:** the docs say a frontmatter value overrides the
+session, and say nothing on whether it also overrides a dispatch-time one — with
+the line gone, the dispatch parameter is the only thing that sets it. §4 says
+what to pass. Unverified live; see HANDOFF row 41.
 
 ````
 FILE: .claude/agents/orch-debugger.md
@@ -6067,7 +6227,8 @@ Run these in order.
 
    > **what changed** (1–2 sentences, `file:line`) · **acceptance** (each check
    > + real exit code, as `orch-task.py verify` printed it, and any report you
-   > supplied rather than the agent) · **checkpoints** hit
+   > supplied rather than the agent) · **review** (`/code-review` findings, or
+   > `not run` and why — §6) · **checkpoints** hit
    > and how resolved, waivers by id · **approval** — each packet that ran on a
    > plan approval rather than being shown · **memory**
    > blocks cited and written, with the lint's count line · **attribution** ·
@@ -6079,6 +6240,18 @@ Run these in order.
 
 Multi-phase work (feature, refactor) runs its playbook's phases in order, each
 its own packet and subagent. Report once at the end, not per phase.
+
+**Support scripts for one running measurement go in one packet.** Glue around
+a measurement (a scorer, a repair step, a `--drop-invalid` flag) arrives as a
+chain, each packet the previous one's gap: three of the five glue packets in
+slm's 2026-10-09 session. Before writing the first, list every script the
+measurement's next stages will need, and what each one's input can get wrong.
+Then write one packet: scope the scripts plus one test file (a test per script
+in it), acceptance that test plus one executable check per script's documented
+output. Up to four scripts of about 150 lines each; more than that is a real
+task. It takes the light lane below with a longer scope list: executable
+acceptance, no sensitive path. A gap found after the packet is dispatched is
+still its own packet.
 
 **Small changes take the light lane.** One file plus its test, executable
 acceptance, no sensitive path: that is one executor packet, not a playbook's
@@ -6155,7 +6328,7 @@ scope: {paths: ["src/muxer.py", "tests/test_muxer.py"], network: false}
 tools: [read, grep, edit, "bash:test"]
 forbidden: [write:outside_scope, network, "git:push"]
 budget: {steps: 25, wall_s: 600}
-effort: medium                   # executor phases only: high -> orch-executor-deep (§4)
+effort: medium                   # executor phases only: passed as the Agent tool's `effort` at dispatch (§4)
 approved: ""                     # after the confirmation: "shown", or the plan's "apr_<id>" (§0)
 notes: ""                        # required when budget deviates, or a floor check is justified
 ```
@@ -6351,9 +6524,15 @@ agent runs and before any cost**:
 ## 4. Dispatch
 
 Spawn the subagent named by the phase's `role` (`orch-executor`,
-`orch-debugger`, `orch-reviewer`). An executor phase whose packet says
-`effort: high` goes to `orch-executor-deep` instead — same contract, deeper
-reasoning, slower and dearer. Choose `high` when the change spans more than one
+`orch-debugger`, `orch-reviewer`). **Every `orch-executor` dispatch passes the
+Agent tool's `effort` parameter, set to the packet's `effort:`** (`medium` when
+the packet has none). The agent's definition carries no effort of its own, so
+this parameter is the only thing that sets it; a dispatch that omits it runs at
+the session's level, which may be neither. `high` is deeper reasoning, slower
+and dearer. (Through v6 this was a second agent, `orch-executor-deep`; v6.1
+retired it — the installer removes the file. If the parameter turns out not to
+take effect, HANDOFF row 41 says how to tell, and `ORCH.v6.md` has the old pair.)
+Choose `high` when the change spans more than one
 module, when the logic is the kind a shallow reading gets subtly wrong
 (concurrency, parsing, security, numerics), or for **any retry of a task that
 failed at `medium`**. Everything else is `medium`: acceptance is re-run by code,
@@ -6367,6 +6546,24 @@ prompt (§3). It carries:
 - `Work only inside <absolute path to .work/<task_id>>. It is a throwaway
   worktree. This path overrides the session's primary working directory.`
 - `If a check looks wrong, FLAG it — do not edit code solely to make it pass.`
+
+**Harness isolation.** If the hooks are installed (the
+`WorktreeCreate` entry is in `.claude/settings.json`), and exactly one executor
+is being dispatched, add the Agent tool's `isolation: "worktree"` to the
+dispatch and arm the task first:
+
+```bash
+# the worktree already exists (§3); then:
+python3 .claude/hooks/orch-worktree.py arm <id>     # then dispatch, with isolation: "worktree"
+python3 .claude/hooks/orch-worktree.py disarm <id>  # after the agent returns
+```
+
+The harness then refuses that agent's writes and git commands that resolve to
+the main checkout, which the guard cannot see from Bash. Parallel dispatches
+(swarm, several packets at once) do NOT use it: the hook cannot tell them apart
+and fails the second create. Dispatch those without `isolation`, as before. If a
+dispatch with it comes back with the agent's `pwd` anywhere but `.work/<id>`,
+stop and report it: the hook was bypassed.
 
 **The agent's report is recorded for you.** `orch-report.py` checks it as it
 leaves the agent — on the `SubagentHandback` call in auto mode, where plain
@@ -6482,6 +6679,11 @@ judgment, and what any finding means.
    pinned upstream tree are summarised, not gated; a claim that does not hold
    is itself a high finding). Medium network findings in test files that name
    no external host are low by policy (`sensitive.yaml` `test_downgrade`).
+   So are `credential material` findings in data files (`data_paths`: eval sets,
+   fixtures, `*.jsonl`) when the added line is only prose, as in a question
+   about a password: an assignment shape (`"password": "x1y2z3w4"`) or a
+   private-key header still gates there, and the same prose in code gates as
+   before (v6.2; `data_downgrade`, `data_keep`).
 
    The base ref defaults to `HEAD^`, which is right only when the task produced
    exactly one commit. Pass the sha the worktree was branched from (§3) and it
@@ -6569,6 +6771,28 @@ On a clean `done`:
   a key is the one failure this system cannot detect later
 - prune the worktree (`git worktree remove`); the work lives on the branch.
   If a dispatched archivist needed it, prune after it reports
+- **independent review (v6.1) — `/code-review`, advisory.** `verify` and
+  `orch-reviewer` check the work against the packet; neither reads the diff the
+  way a reviewer with no packet does. After a clean `verify` and before the merge
+  line, run the `code-review` skill on the branch — `/code-review medium orch/<task_id>`,
+  through the Skill tool — when ANY of these holds: the packet says `effort: high`;
+  the diff touches more than one module or a `sensitive.yaml` path; the task is a
+  retry; the user asked. Skip it on the light lane and say `not run: light lane`.
+  Rules, none of them negotiable:
+  - **never `--fix` and never `--comment`.** `--fix` edits a tree outside the
+    packet's scope, and `--comment` posts to someone else's PR. This reports; it
+    does not change anything;
+  - **it never changes the verdict.** `verify` said `done` or it did not. A
+    finding is evidence for the user, listed under **review** with `file:line`;
+  - **the orchestrator does not fix a finding itself.** One it judges real becomes
+    a new packet (shown and confirmed like any other) or a checkpoint; the branch
+    is not edited after `finish`, because the verify record would no longer match
+    its tip and the merge gate would refuse the merge;
+  - **a finding about the packet** (a check that cannot fail, the wrong scope)
+    goes in `attribution`, as the packet's origin, like any other defect;
+  - the review is the orchestrator's own spend, outside the packet's budget:
+    say so in the summary when it ran. It is not an ORCH guarantee — ultra
+    review is billed and user-triggered, and nothing here launches it.
 - **merging is the user's**, unless they granted it — and even a grant can be
   refused by the harness: auto mode's permission classifier has denied
   `git merge` to an orchestrator the user had told to merge. So never stop a
@@ -7714,6 +7938,11 @@ echo 'x = eval(user_input)'                        > e.py; sc "eval(s)"         
 # slm up_0010: manifests are globs, so a new requirements-train.txt gates
 printf 'torch==2.6.0\n' > requirements-train.txt;          sc "requirements-train.txt" 1
 printf '# notes\n'      > requirements.md;                  sc "requirements.md"        0
+# slm up_0007 (v6.2): a question about a password in eval data is a row, not a leak
+mkdir -p data/eval && printf '{"q": "How do I reset my password?"}\n' > data/eval/q.jsonl; sc "password in eval prose" 0
+printf '{"password": "hunter2xyz"}\n'  > data/eval/r.jsonl;  sc "password assignment in data" 1
+printf 'BEGIN RSA PRIVATE KEY\n'       > data/eval/k.jsonl;  sc "private key in data"         1
+echo '# reset your password'            > reset.py;           sc "password prose in code"       1
 ```
 
 ```bash
@@ -7790,13 +8019,13 @@ lm supersede-archived "--task tsk_m" 0
 lm no-receipt "--task tsk_nope" 1
 rm -f index.bak lint.out
 
-# 17. the deep executor is the executor at another effort, and nothing else:
-#     two copies of one contract drift, and then there are two contracts.
-body() { sed '1,/^---$/{/^---$/!d}' "$1" | sed '1,/^---$/d'; }
-diff <(body .claude/agents/orch-executor.md) <(body .claude/agents/orch-executor-deep.md) >/dev/null
-echo "bodies identical exit=$? (want 0)"
-grep -h '^effort:' .claude/agents/orch-executor.md .claude/agents/orch-executor-deep.md | tr '\n' ' '
-echo "(want effort: medium effort: high)"
+# 17. (v6.1) one executor, effort passed at dispatch. The agent file carries no
+#     effort line (a frontmatter value would shadow the dispatch parameter),
+#     and the retired deep agent goes — also on an update from v6.
+touch .claude/agents/orch-executor-deep.md                # what a v6 install leaves behind
+#    ...re-run the §0 installer for the retire check. It must print `retire .claude/agents/orch-executor-deep.md`.
+echo "effort lines in the executor: $(grep -c '^effort:' .claude/agents/orch-executor.md) (want 0)"
+echo "deep agent removed: $(ls .claude/agents/orch-executor-deep.md 2>&1 | grep -c 'No such file') (want 1)"
 ```
 
 ```bash
@@ -8270,6 +8499,7 @@ printf 'task_id: tsk_v3\nproject: t\nrole: executor\ngoal: "three returns 3"\nba
 git worktree add -q -b orch/tsk_v3 .work/tsk_v3 $b33
 python3 $T prompt tsk_v3 >/dev/null 2>&1; echo "prompt exit=$? (want 0)"
 echo "trailer and id in the prompt: $(grep -c 'trailer "Orch-Task: tsk_v3"' .work/_prompts/tsk_v3.md) $(grep -c '^{"task_id": "tsk_v3"' .work/_prompts/tsk_v3.md) (want 1 1)"
+echo "scratch directory named for the task (v6.2): $(grep -c 'directory whose name is your task id, `tsk_v3`' .work/_prompts/tsk_v3.md) (want 1)"
 echo 'def three(): return 3' > .work/tsk_v3/src/v.py
 rp "the agent hands back" e5 orch-executor PreToolUse '{"task_id": "tsk_v3", "status": "done", "confidence": 0.9, "evidence": [], "new_facts": [], "open_questions": []}' 0
 python3 $T verify tsk_v3 --commit "three returns 3" > out33 2>&1; echo "verify exit=$? (want 0)"
@@ -8414,7 +8644,7 @@ Expected: the usage line and `exit=0` in step 1b (the scan's own invocation
 carries no policy literal, so the guard lets it through), 4 blocks in step 2,
 allow in step 3, `0 2 0 2 2` in step 4, step 5 printing `loosening ignored`,
 `0 2 0 2` in steps 9–10, and every line of steps 11–37 printing its `want`
-(305 `want` lines in all, the last `leftovers: 0 0`).
+(327 `want` lines in all as of v6.2, the last `leftovers: 0 0`).
 Before the fix, step 9's scan exits 2 (`no policy`) and step 10's exits **1** on
 a `UnicodeDecodeError`, which is the findings code. Steps 15–16 were also run
 against a real field repo's packets and memory: the lint flagged both
@@ -8459,6 +8689,51 @@ that session's 18 real packets: 129 warnings and a false error before, 13
 warnings after (9 of them only because master has moved on since). Step 32 replays `settings.json`, as step 23 does, because a hook is
 enforcement only where it is wired.
 
+```bash
+# 38. (v6.1) the worktree hook, and the installer's two default-on switches with
+#     their opt-outs. The runner gives every installer run a scratch HOME.
+H=.claude/hooks/orch-worktree.py; R=$PWD
+git rev-parse -q --verify HEAD >/dev/null || git commit -q --allow-empty -m base
+echo "worktree hooks in a default install: $(grep -c 'orch-worktree.py' .claude/settings.json) (want 2)"
+#    ...installer --check, isolation entries:
+git worktree add -q -b orch/tsk_w1 .work/tsk_w1 HEAD; git worktree add -q -b orch/tsk_w2 .work/tsk_w2 HEAD
+python3 $H arm tsk_w1 >/dev/null; echo "arm exit=$? (want 0)"
+python3 $H arm tsk_w2 >/dev/null 2>&1; echo "second arm refused exit=$? (want 1)"
+P=$(echo "{\"name\":\"bold-oak\",\"cwd\":\"$R\"}" | python3 $H create 2>/dev/null)
+echo "armed create returns the ORCH worktree: $([ "$P" = "$R/.work/tsk_w1" ] && echo yes || echo no:$P) (want yes)"
+echo "marker claimed: $(ls .work/_isolation | tr '\n' ' ') (want tsk_w1.claimed )"
+P=$(echo "{\"name\":\"bold-oak\",\"cwd\":\"$R\"}" | python3 $H create 2>/dev/null)
+echo "nothing armed -> plain worktree: $([ "$P" = "$R/.claude/worktrees/bold-oak" ] && [ -d "$P" ] && echo yes || echo no:$P) (want yes)"
+echo "{\"worktree_path\":\"$R/.work/tsk_w1\",\"cwd\":\"$R\"}" | python3 $H remove
+echo "ORCH worktree survives remove: $([ -d .work/tsk_w1 ] && echo yes || echo no) (want yes)"
+echo "{\"worktree_path\":\"$R/.claude/worktrees/bold-oak\",\"cwd\":\"$R\"}" | python3 $H remove
+echo "plain worktree removed: $([ -d .claude/worktrees/bold-oak ] && echo no || echo yes) (want yes)"
+touch .work/_isolation/tsk_w1.armed .work/_isolation/tsk_w2.armed
+echo "{\"name\":\"x\",\"cwd\":\"$R\"}" | python3 $H create >/dev/null 2>&1; echo "two armed: create exit=$? (want 2)"
+python3 $H disarm tsk_w1 >/dev/null; python3 $H disarm tsk_w2 >/dev/null
+echo "markers left after disarm: $(ls .work/_isolation | wc -l | tr -d ' ') (want 0)"
+python3 $H arm tsk_nope >/dev/null 2>&1; echo "arm on a missing worktree exit=$? (want 1)"
+git -C .work/tsk_w2 checkout -q -b elsewhere; python3 $H arm tsk_w2 >/dev/null 2>&1; echo "arm on the wrong branch exit=$? (want 1)"
+#    ...installer, twice, under a fresh scratch HOME:
+echo "autoMode keeps defaults: $(grep -c '"$defaults"' .orch-home/.claude/settings.json) (want 1)"
+echo "autoMode line once: $(grep -c 'SubagentHandback' .orch-home/.claude/settings.json) (want 1)"
+rm -rf .orch-home
+#    ...installer with both opt-outs, in a fresh repo:
+```
+
+v6.1 (2026-10-08): step 17 now checks that the executor carries no `effort:`
+line and that a leftover `orch-executor-deep.md` is retired by the installer
+(the runner re-runs the installer for it). Step 38 is new: the worktree hook's
+arm / create / remove cases, the default-on `--isolation` / `--user-automode`
+behaviour and their `--no-…` opt-outs. The runner gives every installer run a
+scratch `HOME`, never the real one.
+
+v6.2 (2026-10-09): step 13 gains four scan cases (prose about a password in an
+eval file passes; an assignment or a private-key header in a data file, and the
+same prose in code, still gate); step 33 checks the prompt's scratch-directory
+line. The light-lane batching rule in `orch-task` is guidance, not code: Tier 2
+cannot test it, HANDOFF row 46 reads it.
+
 Step 4 is the one to actually read. Scope enforcement fails **silently** when it
 fails: a packet the guard cannot parse produces no error, no log line, and no
 block — just an agent that can write anywhere. That is why the test asserts both
@@ -8474,14 +8749,14 @@ start; before that, none of them exist.
 |---|---|---|
 | SessionStart fires | start a session in the repo | an `## ORCH state` line with checkpoint/queue counts |
 | skills registered | `/orch-` and look at the completions | four `orch-*` skills listed |
-| subagents registered | ask "what agents are available?" | eight `orch-*` agents |
+| subagents registered | ask "what agents are available?" | seven `orch-*` agents (v6.1; eight through v6) |
 | CLAUDE.md core loaded | ask "what are the ORCH risk triggers?" | answers from the §2 stanza without reading a file |
 | **guard actually blocks a live call** | ask it to `git push --force` on a throwaway branch | the tool call is refused with the ORCH checkpoint text — this is the one that proves oversight is code, not prompting |
 | **blind judge is restricted** | `mkdir -p .work/_blind/msr_t && echo 'item 1: 2+2' > .work/_blind/msr_t/items.md`, then dispatch `orch-judge` on it with canary `<repo>/.orch/state.json` | its reply says `"canary": "refused"`, AND `.work/_blind-denied.log` gained a `Read …/.orch/state.json` line. The log line is the proof; the reply is testimony. No line = the `settings.json` `--blind` entry is not running (workspace trust? an install older than the entry — `--check`?). v4 as first shipped wired it in the judge's frontmatter and failed this row (2026-10-04, 2.1.289, `claude -p`); the `settings.json` entry passed it |
 | stage status at session start | run `python3 .claude/hooks/orch-stage.py run t1 -- true`, then restart | a `## ORCH stages: 1 done` line |
-| **an agent's report is recorded** | in auto mode, dispatch any `orch-executor` packet | `.work/_results/<task_id>/<agent_id>.json` exists with `"via": "SubagentHandback"`, and `verify` prints `report: from orch-executor …`. If the agent first sent prose, `.work/_results/refusals.log` has a line and the record says `"refusals": 1`. Not yet seen live when v6 shipped: that an agent resends after a refused handback — the hook's reason is in its stderr, as for any refused call |
-| **plain-mode report** | the same, outside auto mode | the record says `"via": "SubagentStop"` |
-| **a judge delivers** | the blind-judge row above | the canary line, AND `.work/_results/<msr_id>/<agent_id>.json` holding its labels. v5 failed the second half: SubagentHandback refused six of six times |
+| **an agent's report is recorded** | in auto mode, dispatch any `orch-executor` packet | `.work/_results/<task_id>/<agent_id>.json` exists with `"via": "SubagentHandback"`, and `verify` prints `report: from orch-executor …`. If the agent first sent prose, `.work/_results/refusals.log` has a line and the record says `"refusals": 1`. Seen live 2026-10-07 (2.1.292, `claude -p --permission-mode auto`, slm): JSON on the first report with v6's wording, even when the prompt asked for prose; and an executor that did send prose read the refusal and resent the JSON object |
+| **plain-mode report** | the same, outside auto mode | the record says `"via": "SubagentStop"`. Seen live 2026-10-07 (`--permission-mode acceptEdits`): a prose stop was prevented, and the agent went on to end with the JSON |
+| **a judge delivers** | the blind-judge row above | the canary line, AND `.work/_results/<msr_id>/<agent_id>.json` holding its labels. v5 failed the second half: SubagentHandback refused six of six times. v6 passed both, live, 2026-10-07 |
 | **the archivist is held to its lint** | an ingest that leaves a claim uncited | its first report is refused with the lint's errors (`lint` lines in `refusals.log`) and it repairs before reporting |
 | this session's total | restart, run a stage, `orch-stage.py status` | a `this session:` line counting that stage only |
 
